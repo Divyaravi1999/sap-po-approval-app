@@ -1,0 +1,182 @@
+/* Create PO form styles */
+.create-form-grid { 
+  display: grid; 
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); 
+  gap: 16px; 
+  padding: 20px 24px; 
+}
+
+.po-item-row { 
+  border: 1px solid var(--border); 
+  border-radius: 8px; 
+  padding: 14px; 
+  margin-bottom: 12px; 
+  background: var(--surface); 
+}
+
+.po-item-header { 
+  display: flex; 
+  justify-content: space-between; 
+  align-items: center; 
+  margin-bottom: 12px; 
+  padding-bottom: 10px; 
+  border-bottom: 1px solid var(--border); 
+}
+
+.po-item-number { 
+  font-size: 12px; 
+  font-weight: 700; 
+  color: var(--primary); 
+  text-transform: uppercase; 
+  letter-spacing: 0.5px; 
+}
+
+.btn-remove-item { 
+  background: none; 
+  border: none; 
+  color: var(--text-3); 
+  cursor: pointer; 
+  padding: 4px; 
+  display: flex; 
+  align-items: center; 
+  border-radius: 4px; 
+  transition: all 0.15s; 
+}
+
+.btn-remove-item:hover { 
+  background: #fee2e2; 
+  color: var(--reject); 
+}
+
+.btn-remove-item svg { 
+  width: 16px; 
+  height: 16px; 
+}
+
+.po-item-grid { 
+  display: grid; 
+  grid-template-columns: repeat(3, 1fr); 
+  gap: 12px; 
+}
+
+.po-item-grid .span-2 { 
+  grid-column: span 2; 
+}
+
+@media (max-width: 768px) {
+  .po-item-grid { 
+    grid-template-columns: 1fr; 
+  }
+  .po-item-grid .span-2 { 
+    grid-column: span 1; 
+  }
+  .create-form-grid { 
+    grid-template-columns: 1fr; 
+  }
+}
+
+/* Date filter bar styles */
+.filter-bar {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  padding: 16px 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 20px;
+}
+
+.filter-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.filter-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.filter-bar .input-field {
+  min-width: 160px;
+}
+
+.filter-bar .btn {
+  margin-bottom: 0;
+}
+
+@media (max-width: 768px) {
+  .filter-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  
+  .filter-bar .input-field {
+    width: 100%;
+  }
+}
+
+
+/* Vendor Performance Dashboard Styles */
+.metric-card {
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.metric-label {
+  font-size: 13px;
+  color: var(--text-2);
+  margin-bottom: 8px;
+}
+
+.metric-value {
+  font-size: 32px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.po-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.po-table th {
+  background: var(--bg-2);
+  padding: 12px;
+  text-align: left;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--border);
+}
+
+.po-table td {
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 14px;
+}
+
+.po-table tr:hover {
+  background: var(--bg-1);
+}
+
+.spinner {
+  border: 3px solid var(--border);
+  border-top: 3px solid var(--primary);
+  border-radius: 50%;
+  width: 40px;
+  height: 40px;
+  animation: spin 1s linear infinite;
+  margin: 0 auto;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
