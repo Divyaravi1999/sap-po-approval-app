@@ -6,8 +6,10 @@
   "scripts": {
     "start": "node backend/server.js",
     "start:mcp": "node mcp-server/server.js",
+    "start:qa": "node mcp-server/qa-server.js",
     "dev": "nodemon backend/server.js",
-    "dev:mcp": "nodemon mcp-server/server.js"
+    "dev:mcp": "nodemon mcp-server/server.js",
+    "dev:qa": "nodemon mcp-server/qa-server.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",

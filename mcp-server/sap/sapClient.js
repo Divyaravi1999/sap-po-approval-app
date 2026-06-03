@@ -1019,6 +1019,35 @@ async function createPO(poData) {
     POSCHEDULEX: poSchedulesX
   };
 
+  // Add account assignment for free-text items (no material number)
+  // SAP requires either MATERIAL or account assignment category (KNTTP)
+  const poAccount  = [];
+  const poAccountX = [];
+  poData.items.forEach((item, idx) => {
+    if (!item.material) {
+      const poItem = String((idx + 1) * 10).padStart(5, "0");
+      poAccount.push({
+        PO_ITEM:    poItem,
+        SERIAL_NO:  "01",
+        ACCT_CAT:   item.acctAssCat || "K",   // K = cost center (most common default)
+        COSTCENTER: item.costCenter  || "1000"
+      });
+      poAccountX.push({
+        PO_ITEM:    poItem,
+        SERIAL_NO:  "01",
+        ACCT_CAT:   "X",
+        COSTCENTER: "X"
+      });
+      // Also set KNTTP on the item itself
+      poItems[idx].ACCTASSCAT = item.acctAssCat || "K";
+      poItemsX[idx].ACCTASSCAT = "X";
+    }
+  });
+  if (poAccount.length) {
+    bapiInput.POACCOUNT  = poAccount;
+    bapiInput.POACCOUNTX = poAccountX;
+  }
+
   console.log(`[createPO] Calling BAPI_PO_CREATE1...`);
   console.log(`[createPO] Input data:`, JSON.stringify({
     companyCode: poData.companyCode,
@@ -1118,9 +1147,9 @@ async function createPO(poData) {
     console.error(`[createPO] BAPI returned errors: ${errorMsg}`);
     
     // Check for fiscal year error and provide helpful message
-    if (errorMsg.includes("fiscal year") || errorMsg.includes("no period is defined") || errorMsg.includes("posting period") || errorMsg.includes("period") && errorMsg.includes("closed")) {
+    if (errorMsg.includes("fiscal year") || errorMsg.includes("no period is defined") || errorMsg.includes("posting period") || (errorMsg.includes("period") && errorMsg.includes("closed"))) {
       const diagnosticInfo = `
-Document Date Used: ${docDate} (formatted as ${docDateFormatted})
+Document Date Used: ${docDate}
 Original Date Requested: ${poData.docDate || 'not specified'}
 Company Code: ${poData.companyCode}
 

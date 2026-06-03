@@ -24,8 +24,10 @@ router.post("/chat", async (req, res) => {
 
     console.log(`[AI Route] Received message: "${message}"`);
 
-    // Process with AI agent
-    const result = await aiAgent.chat(message.trim(), context || {});
+    // Process with AI agent — pass sessionId for state persistence
+    const ctx = context || {};
+    if (!ctx.sessionId) ctx.sessionId = req.headers["x-session-id"] || "default";
+    const result = await aiAgent.chat(message.trim(), ctx);
 
     res.json(result);
 

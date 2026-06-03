@@ -3,6 +3,8 @@
 const API = "";
 let currentPO = null;
 let sessionStats = { pending: 0, approved: 0, reset: 0 };
+let allPOs = [];           // full unfiltered list
+let activeStatusFilter = null; // "PENDING" | "APPROVED" | "RESET" | null
 
 // ─── SSE ──────────────────────────────────────────────────────────────────────
 function initSSE() {
@@ -51,6 +53,16 @@ function updateSidebarStats() {
   document.getElementById("stat-pending").textContent  = sessionStats.pending;
   document.getElementById("stat-approved").textContent = sessionStats.approved;
   document.getElementById("stat-rejected").textContent = sessionStats.reset;
+
+  // Highlight active filter card
+  document.querySelectorAll(".stat-card").forEach(card => {
+    card.classList.remove("stat-active");
+  });
+  if (activeStatusFilter) {
+    const map = { PENDING: "stat-card-pending", APPROVED: "stat-card-approved", RESET: "stat-card-reset" };
+    const el = document.getElementById(map[activeStatusFilter]);
+    if (el) el.classList.add("stat-active");
+  }
 }
 
 // ─── PO List ──────────────────────────────────────────────────────────────────
@@ -84,14 +96,18 @@ async function loadPOList() {
     skeleton.classList.add("hidden");
     const pos = json.data;
 
+    // Store full list for client-side filtering
+    allPOs = pos || [];
+
     // Calculate statistics from the actual list
     const pendingCount = pos.filter(po => po.STATUS === "PENDING").length;
     const approvedCount = pos.filter(po => po.STATUS === "APPROVED").length;
-    
+    const resetCount = pos.filter(po => po.STATUS === "RESET").length;
+
     // Update sidebar stats with actual counts from the list
-    sessionStats.pending = pendingCount;
+    sessionStats.pending  = pendingCount;
     sessionStats.approved = approvedCount;
-    sessionStats.reset = 0; // No rejected status in this app
+    sessionStats.reset    = resetCount;
     updateSidebarStats();
 
     if (!pos || pos.length === 0) {
@@ -99,8 +115,7 @@ async function loadPOList() {
       return;
     }
 
-    grid.innerHTML = pos.map(po => buildPOCard(po)).join("");
-    grid.classList.remove("hidden");
+    renderPOGrid();
   } catch (err) {
     skeleton.classList.add("hidden");
     errorMsg.textContent = err.message;
@@ -112,6 +127,66 @@ function clearDateFilters() {
   document.getElementById("filter-from-date").value = "";
   document.getElementById("filter-to-date").value = "";
   loadPOList();
+}
+
+// ─── Client-side status filter ────────────────────────────────────────────────
+function filterByStatus(status) {
+  const grid  = document.getElementById("po-card-grid");
+  const empty = document.getElementById("list-empty");
+
+  // Toggle off if same filter clicked again
+  if (activeStatusFilter === status) {
+    activeStatusFilter = null;
+  } else {
+    activeStatusFilter = status;
+    // Navigate to PO list view if not already there
+    showPOList();
+  }
+
+  updateSidebarStats();
+  renderPOGrid();
+
+  // Scroll to top of list
+  grid.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function renderPOGrid() {
+  const grid  = document.getElementById("po-card-grid");
+  const empty = document.getElementById("list-empty");
+
+  const filtered = activeStatusFilter
+    ? allPOs.filter(po => (po.STATUS || "PENDING") === activeStatusFilter)
+    : allPOs;
+
+  // Show/hide filter badge in breadcrumb
+  const breadcrumb = document.getElementById("breadcrumb");
+  if (activeStatusFilter) {
+    breadcrumb.innerHTML = `<span class="filter-indicator">
+      ${activeStatusFilter}
+      <button onclick="filterByStatus('${activeStatusFilter}')" title="Clear filter">✕</button>
+    </span>`;
+  } else {
+    breadcrumb.innerHTML = "";
+  }
+
+  if (filtered.length === 0) {
+    grid.classList.add("hidden");
+    empty.classList.remove("hidden");
+    const emptyP    = empty.querySelector("p");
+    const emptySpan = empty.querySelector("span");
+    if (activeStatusFilter && emptyP) {
+      emptyP.textContent = `No ${activeStatusFilter.toLowerCase()} purchase orders`;
+      if (emptySpan) emptySpan.textContent = `There are no POs with status "${activeStatusFilter}" at this time.`;
+    } else if (emptyP) {
+      emptyP.textContent = "No pending purchase orders";
+      if (emptySpan) emptySpan.textContent = "All caught up — nothing waiting for approval.";
+    }
+    return;
+  }
+
+  empty.classList.add("hidden");
+  grid.innerHTML = filtered.map(po => buildPOCard(po)).join("");
+  grid.classList.remove("hidden");
 }
 
 function buildPOCard(po) {
@@ -261,32 +336,28 @@ function renderReleaseChain(po) {
     // If no release steps but we have FRGKE/FRGZU, show basic approval status
     if (po.FRGKE !== undefined || po.FRGZU !== undefined) {
       card.classList.remove("hidden");
-      
-      // Determine approval status message
-      let statusMessage = '';
-      let statusClass = '';
-      
-      if (po.FRGKE === 'G') {
-        statusMessage = 'This purchase order has been fully approved and released';
-        statusClass = 'success';
-      } else if (po.FRGKE === '' || !po.FRGKE) {
-        statusMessage = 'This purchase order is pending approval';
-        statusClass = 'pending';
-      } else {
-        statusMessage = `Approval in progress - Release code: ${po.FRGKE}`;
-        statusClass = 'info';
-      }
-      
+
+      const isApproved = po.FRGKE === 'G';
+      const isPending  = !po.FRGKE;
+      const statusKey  = isApproved ? 'approved' : isPending ? 'pending' : 'in-progress';
+
+      const statusMeta = {
+        approved:    { label: 'Fully Released',    sub: 'This purchase order has been approved and released for processing.', icon: `<svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/></svg>` },
+        pending:     { label: 'Awaiting Approval', sub: 'No release code has been applied yet. Use the action panel below to approve.', icon: `<svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clip-rule="evenodd"/></svg>` },
+        'in-progress': { label: 'Approval In Progress', sub: 'Partial release applied. Further approval steps may be required.', icon: `<svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.38z" clip-rule="evenodd"/></svg>` }
+      };
+
+      const meta = statusMeta[statusKey];
+
       chain.innerHTML = `
-        <div class="approval-status-simple">
-          <div class="approval-status-icon ${statusClass}">
-            ${po.FRGKE === 'G' ? '✓' : '⏳'}
+        <div class="approval-status-banner ${statusKey}">
+          <div class="asb-icon">${meta.icon}</div>
+          <div class="asb-body">
+            <div class="asb-title">${meta.label}</div>
+            <div class="asb-sub">${meta.sub}</div>
           </div>
-          <div class="approval-status-content">
-            <div class="approval-status-message">${statusMessage}</div>
-            ${po.FRGKE && po.FRGKE !== 'G' ? `<div class="approval-status-detail">Release Code: <strong>${escHtml(po.FRGKE)}</strong></div>` : ''}
-            ${po.FRGZU ? `<div class="approval-status-detail">Release Status: <strong>${escHtml(po.FRGZU)}</strong></div>` : ''}
-          </div>
+          ${po.FRGKE && !isApproved ? `<div class="asb-badge">Code: <strong>${escHtml(po.FRGKE)}</strong></div>` : ''}
+          ${po.FRGZU ? `<div class="asb-badge secondary">Status: <strong>${escHtml(po.FRGZU)}</strong></div>` : ''}
         </div>
       `;
     } else {

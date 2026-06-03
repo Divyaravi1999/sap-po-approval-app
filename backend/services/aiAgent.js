@@ -1,396 +1,434 @@
 "use strict";
 
 /**
- * AI Agent Service using Google Gemini
- * Provides natural language interface to SAP operations
+ * AI Agent — regex intent classification + deterministic slot-filling
+ * Gemini is used ONLY for initial entity extraction on the first turn.
+ * All slot-fill answers (follow-up turns) are handled by deterministic code.
  */
 
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const mcp = require("./mcpClient");
 
-// Load API keys from environment
-const API_KEYS = [
-  process.env.GEMINI_API_KEY_1,
-  process.env.GEMINI_API_KEY_2
-].filter(key => key); // Remove undefined keys
-
-if (API_KEYS.length === 0) {
-  throw new Error("No Gemini API keys configured. Please set GEMINI_API_KEY_1 and/or GEMINI_API_KEY_2 in .env file");
+// ─── Gemini setup ─────────────────────────────────────────────────────────────
+const API_KEYS = [process.env.GEMINI_API_KEY_1, process.env.GEMINI_API_KEY_2].filter(Boolean);
+if (!API_KEYS.length) throw new Error("No Gemini API keys configured.");
+let _keyIdx = 0;
+const MODELS = ["gemini-2.5-flash-lite", "gemini-1.5-flash", "gemini-1.5-flash-8b"];
+let _modelIdx = 0;
+function getApiKey() { return API_KEYS[_keyIdx % API_KEYS.length]; }
+function nextKey()   { _keyIdx = (_keyIdx + 1) % API_KEYS.length; }
+function nextModel() { _modelIdx = (_modelIdx + 1) % MODELS.length; }
+function getModel()  { return MODELS[_modelIdx % MODELS.length]; }
+function isQuota(e)  {
+  const s = String(e).toLowerCase();
+  return s.includes("429") || s.includes("503") || s.includes("quota") || s.includes("rate limit");
 }
 
-console.log(`[AI Agent] Loaded ${API_KEYS.length} API key(s)`);
-
-// Track current key index and failure counts
-let currentKeyIndex = 0;
-let keyFailureCounts = new Array(API_KEYS.length).fill(0);
-const MAX_FAILURES_PER_KEY = 3;
-
-/**
- * Get the next available API key
- */
-function getNextApiKey() {
-  // Try to find a key that hasn't failed too many times
-  for (let i = 0; i < API_KEYS.length; i++) {
-    const index = (currentKeyIndex + i) % API_KEYS.length;
-    if (keyFailureCounts[index] < MAX_FAILURES_PER_KEY) {
-      currentKeyIndex = index;
-      console.log(`[AI Agent] Using API key #${index + 1}`);
-      return API_KEYS[index];
-    }
-  }
-  
-  // All keys have failed, reset counters and try again
-  console.warn(`[AI Agent] All API keys exhausted, resetting failure counts`);
-  keyFailureCounts = new Array(API_KEYS.length).fill(0);
-  currentKeyIndex = 0;
-  return API_KEYS[0];
+// ─── Session store ────────────────────────────────────────────────────────────
+const sessions = new Map();
+function getSession(id) {
+  if (!id) id = "default";
+  if (!sessions.has(id)) sessions.set(id, newSession());
+  return sessions.get(id);
 }
-
-/**
- * Mark current key as failed and rotate to next
- */
-function markKeyAsFailed(error) {
-  keyFailureCounts[currentKeyIndex]++;
-  console.warn(`[AI Agent] API key #${currentKeyIndex + 1} failed (${keyFailureCounts[currentKeyIndex]}/${MAX_FAILURES_PER_KEY}): ${error}`);
-  
-  // Move to next key
-  currentKeyIndex = (currentKeyIndex + 1) % API_KEYS.length;
-}
-
-/**
- * Check if error is quota/rate limit related
- */
-function isQuotaError(error) {
-  const errorStr = error.toString().toLowerCase();
-  return errorStr.includes('429') || 
-         errorStr.includes('503') ||
-         errorStr.includes('quota') || 
-         errorStr.includes('rate limit') ||
-         errorStr.includes('resource_exhausted') ||
-         errorStr.includes('high demand');
-}
-
-// Define tools/functions that AI can use
-const tools = [
-  {
-    name: "get_pending_pos",
-    description: "Get list of pending purchase orders. Can filter by release code, date range, or vendor. Returns array of PO objects with EBELN, LIFNR, WAERS, NETWR, BEDAT, STATUS fields.",
-    parameters: {
-      type: "object",
-      properties: {
-        releaseCode: {
-          type: "string",
-          description: "Filter by release code (optional). Example: 'R', 'B', 'FR'"
-        },
-        fromDate: {
-          type: "string",
-          description: "Start date in YYYY-MM-DD format (optional). Example: '2026-01-01'"
-        },
-        toDate: {
-          type: "string",
-          description: "End date in YYYY-MM-DD format (optional). Example: '2026-12-31'"
-        }
-      }
-    }
-  },
-  {
-    name: "get_po_detail",
-    description: "Get detailed information about a specific purchase order including items, vendor, amounts, release status, and line items. Returns PO object with header and items array.",
-    parameters: {
-      type: "object",
-      properties: {
-        poNumber: {
-          type: "string",
-          description: "Purchase order number. Example: '4500022395'"
-        }
-      },
-      required: ["poNumber"]
-    }
-  },
-  {
-    name: "approve_po",
-    description: "Approve a purchase order with a specific release code. This executes BAPI_PO_RELEASE in SAP. Returns success message with new release status.",
-    parameters: {
-      type: "object",
-      properties: {
-        poNumber: {
-          type: "string",
-          description: "Purchase order number to approve. Example: '4500022395'"
-        },
-        releaseCode: {
-          type: "string",
-          description: "Release code for approval. Must be valid for the PO's release strategy. Example: 'R', 'B', 'FR'"
-        }
-      },
-      required: ["poNumber", "releaseCode"]
-    }
-  },
-  {
-    name: "reset_po_release",
-    description: "Reset/undo the release approval for a purchase order. Use the SAME release code that was used to approve (check FRGKE field). This executes BAPI_PO_RESET_RELEASE in SAP.",
-    parameters: {
-      type: "object",
-      properties: {
-        poNumber: {
-          type: "string",
-          description: "Purchase order number. Example: '4500022395'"
-        },
-        releaseCode: {
-          type: "string",
-          description: "Release code to reset. MUST match the current FRGKE value. Example: 'R'"
-        }
-      },
-      required: ["poNumber", "releaseCode"]
-    }
-  },
-  {
-    name: "get_vendor_performance",
-    description: "Get performance metrics for a specific vendor including total POs, total spend, on-time delivery percentage, average delivery delay, and list of recent POs with delivery dates.",
-    parameters: {
-      type: "object",
-      properties: {
-        vendorId: {
-          type: "string",
-          description: "Vendor ID. Can be with or without leading zeros. Example: '1000' or '0000001015'"
-        }
-      },
-      required: ["vendorId"]
-    }
-  },
-  {
-    name: "create_po",
-    description: "Create a new purchase order in SAP with specified vendor, company code, purchasing org, and line items. Returns new PO number.",
-    parameters: {
-      type: "object",
-      properties: {
-        vendor: {
-          type: "string",
-          description: "Vendor ID. Example: '1000'"
-        },
-        companyCode: {
-          type: "string",
-          description: "Company code. Example: '1000'"
-        },
-        purchOrg: {
-          type: "string",
-          description: "Purchasing organization. Example: '1000'"
-        },
-        purchGroup: {
-          type: "string",
-          description: "Purchasing group. Example: '001'"
-        },
-        items: {
-          type: "array",
-          description: "Array of line items for the PO",
-          items: {
-            type: "object",
-            properties: {
-              description: { type: "string", description: "Item description" },
-              quantity: { type: "number", description: "Quantity to order" },
-              unit: { type: "string", description: "Unit of measure. Example: 'EA', 'KG'" },
-              netPrice: { type: "number", description: "Price per unit" },
-              plant: { type: "string", description: "Plant code. Example: '1000'" },
-              material: { type: "string", description: "Material number (optional). Example: '100-100'" }
-            },
-            required: ["description", "quantity", "unit", "netPrice", "plant"]
-          }
-        }
-      },
-      required: ["vendor", "companyCode", "purchOrg", "purchGroup", "items"]
-    }
-  }
-];
-
-// System instruction for Gemini
-const SYSTEM_INSTRUCTION = `You are an intelligent procurement assistant for an SAP-integrated purchase order management system.
-
-Your role:
-- Help users manage purchase orders efficiently through natural language commands
-- Execute SAP operations using the available functions
-- Provide clear, concise, and actionable responses
-- Always confirm what actions you performed
-
-Important guidelines:
-1. When resetting PO releases, use the SAME release code from the FRGKE field (not the original approval code)
-2. For bulk operations (e.g., "approve all POs from vendor X"), first get the list, then approve each one
-3. Always provide summaries with PO numbers and amounts after operations
-4. If information is missing, ask clarifying questions
-5. Be proactive: understand user intent and execute appropriate actions
-6. Format responses clearly with bullet points for lists
-7. Use emojis sparingly for visual clarity (✅ for success, ⚠️ for warnings, 📊 for data)
-
-Available operations:
-- View PO lists and details
-- Approve/reset PO releases  
-- Check vendor performance metrics
-- Create new purchase orders
-- Analyze and compare data
-
-Always be helpful, efficient, and accurate!`;
-
-/**
- * Main chat function - processes user message and executes appropriate tools
- * Includes automatic API key rotation on quota/rate limit errors
- */
-async function chat(userMessage, context = {}) {
-  const maxRetries = API_KEYS.length;
-  let lastError = null;
-
-  // Try with different API keys if needed
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      console.log(`[AI Agent] Processing message (attempt ${attempt + 1}/${maxRetries}): "${userMessage}"`);
-      console.log(`[AI Agent] Context:`, context);
-
-      // Get current API key
-      const apiKey = getNextApiKey();
-      const genAI = new GoogleGenerativeAI(apiKey);
-
-      // Initialize model with function calling
-      const model = genAI.getGenerativeModel({
-        model: "gemini-2.5-flash-lite"
-      });
-
-      // Build context-aware prompt
-      let contextPrompt = "";
-      if (context.currentView) {
-        contextPrompt += `User is currently viewing: ${context.currentView}. `;
-      }
-      if (context.currentPO) {
-        contextPrompt += `Current PO in view: ${context.currentPO}. `;
-      }
-      
-      const fullPrompt = contextPrompt + userMessage;
-
-      // Start chat session with system instruction and tools
-      const chat = model.startChat({
-        generationConfig: {
-          temperature: 0.7,
-          topP: 0.8,
-          topK: 40,
-          maxOutputTokens: 2048,
-        },
-        systemInstruction: {
-          parts: [{ text: SYSTEM_INSTRUCTION }]
-        },
-        tools: [{ functionDeclarations: tools }],
-        history: []
-      });
-
-      let actionPerformed = false;
-      let finalResponse = "";
-
-      // Send message and get response
-      const result = await chat.sendMessage(fullPrompt);
-      const response = result.response;
-
-      // Check if AI wants to call functions
-      const functionCalls = response.functionCalls();
-      
-      if (functionCalls && functionCalls.length > 0) {
-        console.log(`[AI Agent] AI requested ${functionCalls.length} function call(s)`);
-        
-        // Execute all function calls
-        const functionResponses = [];
-        
-        for (const call of functionCalls) {
-          console.log(`[AI Agent] Executing function: ${call.name}`, call.args);
-          
-          try {
-            const toolResult = await executeTool(call.name, call.args);
-            functionResponses.push({
-              functionResponse: {
-                name: call.name,
-                response: toolResult
-              }
-            });
-            actionPerformed = true;
-            console.log(`[AI Agent] Function ${call.name} executed successfully`);
-          } catch (error) {
-            console.error(`[AI Agent] Function ${call.name} failed:`, error.message);
-            functionResponses.push({
-              functionResponse: {
-                name: call.name,
-                response: { error: error.message }
-              }
-            });
-          }
-        }
-
-        // Send function results back to AI for final response
-        const finalResult = await chat.sendMessage(functionResponses);
-        finalResponse = finalResult.response.text();
-        
-      } else {
-        // No function calls, just return the text response
-        finalResponse = response.text();
-      }
-
-      console.log(`[AI Agent] Final response: ${finalResponse.substring(0, 100)}...`);
-
-      // Success! Reset failure count for this key
-      keyFailureCounts[currentKeyIndex] = 0;
-
-      return {
-        success: true,
-        response: finalResponse,
-        actionPerformed: actionPerformed
-      };
-
-    } catch (error) {
-      console.error(`[AI Agent] Error on attempt ${attempt + 1}:`, error.message);
-      lastError = error;
-
-      // Check if it's a quota/rate limit error
-      if (isQuotaError(error)) {
-        markKeyAsFailed(error.message);
-        
-        // If we have more keys to try, continue
-        if (attempt < maxRetries - 1) {
-          console.log(`[AI Agent] Retrying with next API key...`);
-          continue;
-        }
-      } else {
-        // Non-quota error, don't retry
-        break;
-      }
-    }
-  }
-
-  // All attempts failed
-  console.error("[AI Agent] All API keys exhausted or non-recoverable error");
+function newSession() {
   return {
-    success: false,
-    error: lastError?.message || "AI agent failed to process request"
+    intent:       null,   // CREATE_PO | APPROVE_PO | RESET_PO | GET_PO_DETAILS | LIST_PENDING_POS
+    fields:       {},     // collected: vendor, poNumber, releaseCode, items
+    pendingSlot:  null,   // which slot we're currently waiting for
+    lastResponse: null,
+    turnCount:    0
   };
 }
+function clearSession(id) { sessions.set(id || "default", newSession()); }
+const MAX_TURNS = 10;
 
-/**
- * Execute a tool/function by calling the appropriate MCP client method
- */
-async function executeTool(toolName, args) {
-  switch (toolName) {
-    case "get_pending_pos":
-      return await mcp.getPendingPOs(args.releaseCode, args.fromDate, args.toDate);
+// ─── Intent classification (pure regex, always reliable) ─────────────────────
+function classifyIntent(msg) {
+  const t = msg.toLowerCase();
+  const hasPoNumber = /\b\d{7,12}\b/.test(msg);
 
-    case "get_po_detail":
-      return await mcp.getPODetail(args.poNumber);
+  // LIST intents — check before action intents to avoid "approve po list" → APPROVE_PO
+  if (/\b(approved|approve)\b/.test(t) && /\b(list|all|show|display)\b/.test(t) && /\b(po|purchase\s*order)s?\b/.test(t) && !hasPoNumber) return "LIST_APPROVED_POS";
+  if (/\b(pending)\b/.test(t) && /\b(po|purchase\s*order)s?\b/.test(t) && !hasPoNumber) return "LIST_PENDING_POS";
+  if (/\b(list|show|display|all)\b/.test(t) && /\b(po|purchase\s*order)s?\b/.test(t) && !hasPoNumber && !/\bdetail\b/.test(t)) return "LIST_PENDING_POS";
 
-    case "approve_po":
-      return await mcp.approvePO(args.poNumber, args.releaseCode);
+  // Vendor performance
+  if (/\b(vendor\s*performance|performance|vendor\s*metric|vendor\s*stat)\b/.test(t)) return "VENDOR_PERFORMANCE";
+  // Action intents — require a PO number or explicit action keyword with no list context
+  if (/\b(approve|release)\b/.test(t) && /\b(po|purchase\s*order|\d{7,12})\b/.test(t) && !/\b(list|all|show.*list)\b/.test(t)) return "APPROVE_PO";
+  if (/\b(reset|reject|undo|revert)\b/.test(t) && /\b(po|purchase\s*order|\d{7,12})\b/.test(t)) return "RESET_PO";
+  if (/\b(create|new|make|raise|add|generate|place)\b/.test(t) && /\b(po|purchase\s*order)\b/.test(t)) return "CREATE_PO";
 
-    case "reset_po_release":
-      return await mcp.rejectPO(args.poNumber, args.releaseCode);
-
-    case "get_vendor_performance":
-      return await mcp.getVendorPerformance(args.vendorId);
-
-    case "create_po":
-      return await mcp.createPO(args);
-
-    default:
-      throw new Error(`Unknown tool: ${toolName}`);
-  }
+  // Detail
+  if (hasPoNumber || (/\b(detail|info|status|about|show)\b/.test(t) && /\bpo\b/.test(t))) return "GET_PO_DETAILS";
+  return null;
 }
 
-module.exports = { chat };
+// ─── Deterministic entity extraction ─────────────────────────────────────────
+function extractEntities(msg) {
+  const ent = {};
+  const poMatch = msg.match(/\b(\d{7,12})\b/);
+  if (poMatch) ent.poNumber = poMatch[1];
+  const vendorMatch = msg.match(/\bvendor\s*(?:number|id|#|:)?\s*[:\-]?\s*(\w+)/i);
+  if (vendorMatch) ent.vendor = vendorMatch[1];
+  const rcMatch = msg.match(/(?:release\s*code|code)[:\s]+([A-Z0-9]{1,4})/i)
+               || msg.match(/\bwith\s+([A-Z0-9]{1,4})\b/i);
+  if (rcMatch) ent.releaseCode = rcMatch[1].toUpperCase();
+  ent.items = parseItems(msg);
+  return ent;
+}
+
+// Parse "book, 10, 50" or "Laptop 2 500" or "3 x Chair at 200"
+function parseItems(msg) {
+  const items = [];
+
+  // Pattern: "desc, qty, price" (comma-separated)
+  const csv = msg.match(/^([a-zA-Z][^,]{0,40}),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)$/);
+  if (csv) {
+    items.push({ description: csv[1].trim(), quantity: parseFloat(csv[2]), unit: "EA", netPrice: parseFloat(csv[3]), plant: "1000" });
+    return items;
+  }
+
+  // Pattern: qty x desc at/for price
+  const p1 = /(\d+(?:\.\d+)?)\s+(?:x\s+)?([a-zA-Z][a-zA-Z0-9 \-]{1,40}?)\s+(?:at|for|@|price)\s+\$?(\d+(?:\.\d+)?)/gi;
+  let m;
+  while ((m = p1.exec(msg)) !== null) {
+    items.push({ description: m[2].trim(), quantity: parseFloat(m[1]), unit: "EA", netPrice: parseFloat(m[3]), plant: "1000" });
+  }
+  return items;
+}
+
+// ─── Slot-fill answer extractor ───────────────────────────────────────────────
+// Called when we're waiting for a specific slot answer
+function extractSlotAnswer(pendingSlot, msg) {
+  const t = msg.trim();
+  switch (pendingSlot) {
+    case "vendor":
+      // Accept any word/number as vendor
+      return t || null;
+
+    case "vendorId":
+      return t || null;
+
+    case "poNumber": {
+      const m = msg.match(/\b(\d{7,12})\b/);
+      return m ? m[1] : (t.match(/^\d+$/) ? t : null);
+    }
+
+    case "releaseCode": {
+      const m = msg.match(/\b([A-Z0-9]{1,4})\b/i);
+      return m ? m[1].toUpperCase() : null;
+    }
+
+    case "items": {
+      const items = parseItems(msg);
+      return items.length ? items : null;
+    }
+  }
+  return null;
+}
+
+// ─── Gemini entity extraction (first turn only, for complex messages) ─────────
+const ENTITY_PROMPT = `Extract entities from this purchase order message. Return ONLY valid JSON, no markdown.
+Schema: {"vendor":null,"po_id":null,"release_code":null,"items":[{"description":null,"quantity":null,"price":null}]}
+Rules:
+- vendor: extract vendor number/id if present
+- po_id: any 7-12 digit PO number
+- release_code: release/approval code like R1, AB, 01
+- items: array of {description, quantity, price} — map "book,10,50" to description=book,quantity=10,price=50
+- Use null for missing values
+- Return empty items array [] if no items found`;
+
+async function geminiExtract(msg) {
+  const maxAttempts = API_KEYS.length * MODELS.length;
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const genAI = new GoogleGenerativeAI(getApiKey());
+      const model = genAI.getGenerativeModel({ model: getModel() });
+      const result = await model.generateContent([{ text: ENTITY_PROMPT }, { text: msg }]);
+      const raw = result.response.text().trim()
+        .replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
+      return JSON.parse(raw);
+    } catch (err) {
+      if (isQuota(err)) { nextKey(); nextModel(); continue; }
+      break;
+    }
+  }
+  return {};
+}
+
+// ─── Slot definitions ─────────────────────────────────────────────────────────
+const SLOT_QUESTIONS = {
+  vendor:      "Please provide the vendor ID.",
+  poNumber:    "Which PO number?",
+  releaseCode: "Please provide the release code.",
+  items:       "Please provide item details (description, quantity, price). Example: Laptop, 2, 500.",
+  vendorId:    "Which vendor ID would you like performance data for?"
+};
+
+const REQUIRED_SLOTS = {
+  CREATE_PO:          ["vendor", "items"],
+  APPROVE_PO:         ["poNumber", "releaseCode"],
+  RESET_PO:           ["poNumber", "releaseCode"],
+  GET_PO_DETAILS:     ["poNumber"],
+  VENDOR_PERFORMANCE: ["vendorId"]
+};
+
+function getNextMissingSlot(intent, fields) {
+  const required = REQUIRED_SLOTS[intent] || [];
+  for (const slot of required) {
+    const val = fields[slot];
+    if (slot === "items") { if (!Array.isArray(val) || !val.length) return slot; }
+    else if (!val) return slot;
+  }
+  return null;
+}
+
+// ─── Validation ───────────────────────────────────────────────────────────────
+function validateItems(items) {
+  const errors = [];
+  (items || []).forEach((item, i) => {
+    const name = item.description || `item ${i + 1}`;
+    if (!item.description?.trim()) errors.push(`Item ${i + 1}: description is required`);
+    if (!(item.quantity > 0))      errors.push(`"${name}": quantity must be greater than 0`);
+    if (!(item.netPrice > 0))      errors.push(`"${name}": price must be greater than 0`);
+  });
+  return errors;
+}
+
+// ─── Formatters ───────────────────────────────────────────────────────────────
+function formatList(data) {
+  const all  = Array.isArray(data) ? data : (data?.data ?? []);
+  const list = all.filter(po => (po.STATUS || "").toUpperCase() !== "APPROVED");
+  if (!list.length) return "No pending purchase orders found.";
+  const rows = list.slice(0, 20).map(po =>
+    `• PO: ${po.EBELN}\n  Vendor: ${po.LIFNR} | Amount: ${po.WAERS} ${Number(po.NETWR || 0).toLocaleString()} | Date: ${po.BEDAT || "—"} | Status: ${po.STATUS || "Pending"}`
+  ).join("\n\n");
+  return `Found ${list.length} pending PO(s):\n\n${rows}`;
+}
+
+function formatDetail(raw) {
+  const d = raw?.data ?? raw;
+  if (!d?.EBELN) return "No details found for that PO.";
+  const lines = [
+    `PO Number : ${d.EBELN}`,
+    `Vendor    : ${d.LIFNR}`,
+    `Currency  : ${d.WAERS}`,
+    `Amount    : ${Number(d.NETWR || 0).toLocaleString()}`,
+    `Date      : ${d.BEDAT || "—"}`,
+    `Status    : ${d.STATUS || "—"}`,
+    `Purch Org : ${d.EKORG || "—"}`,
+    `Company   : ${d.BUKRS || "—"}`
+  ];
+  if (Array.isArray(d.items) && d.items.length) {
+    lines.push("\nLine Items:");
+    d.items.forEach((it, i) =>
+      lines.push(`  ${i + 1}. ${it.TXZ01 || it.description || "—"} | Qty: ${it.MENGE} ${it.MEINS} | Price: ${it.NETPR}`)
+    );
+  }
+  return lines.join("\n");
+}
+
+// ─── Main chat ────────────────────────────────────────────────────────────────
+async function chat(userMessage, context = {}) {
+  const sessionId = context.sessionId || "default";
+  const session   = getSession(sessionId);
+  session.turnCount++;
+
+  const log = { turn: session.turnCount, message: userMessage, intent: null, fields: {}, executed: false };
+
+  // ── CASE 1: We're waiting for a specific slot answer ─────────────────────
+  if (session.pendingSlot) {
+    const answer = extractSlotAnswer(session.pendingSlot, userMessage);
+    if (answer) {
+      if (session.pendingSlot === "items") {
+        session.fields.items = answer;
+      } else {
+        session.fields[session.pendingSlot] = answer;
+      }
+      session.pendingSlot = null;
+      console.log(`[Agent] Slot filled: ${session.pendingSlot} = ${JSON.stringify(answer)}`);
+    } else {
+      // Couldn't extract — re-ask
+      const q = SLOT_QUESTIONS[session.pendingSlot];
+      return respond(session, log, `I couldn't understand that. ${q}`, false);
+    }
+  } else {
+    // ── CASE 2: Fresh message — classify intent ───────────────────────────
+    const detected = classifyIntent(userMessage);
+
+    if (detected && detected !== session.intent) {
+      session.intent     = detected;
+      session.fields     = {};
+      session.pendingSlot = null;
+      session.turnCount  = 1;
+    } else if (!session.intent && !detected) {
+      const help = [
+        "I can help you with:",
+        "• \"show pending POs\" — list pending purchase orders",
+        "• \"show PO 4500012345\" — view PO details",
+        "• \"approve PO 4500012345 with code R1\" — approve a PO",
+        "• \"reset PO 4500012345 with code R1\" — reset a release",
+        "• \"create a new PO\" — create a purchase order",
+        "• \"vendor performance 1000\" — view vendor performance"
+      ].join("\n");
+      return respond(session, log, help, false);
+    }
+
+    // Extract entities from the message (regex first, Gemini as fallback for items)
+    const ent = extractEntities(userMessage);
+    if (ent.poNumber)    session.fields.poNumber    = ent.poNumber;
+    if (ent.vendor)      session.fields.vendor      = ent.vendor;
+    if (ent.releaseCode) session.fields.releaseCode = ent.releaseCode;
+    if (ent.items?.length) session.fields.items     = ent.items;
+    // For vendor performance, extract vendor ID
+    if (session.intent === "VENDOR_PERFORMANCE") {
+      // Match explicit "vendor <id>" or a standalone number (not part of "performance")
+      const vMatch = userMessage.match(/\bvendor\s*(?:id|#|number|:)?\s*[:\-]?\s*(\d+)/i)
+                  || userMessage.match(/\bof\s+(\d+)\b/i)
+                  || userMessage.match(/\bfor\s+(\d+)\b/i)
+                  || userMessage.match(/\b(\d{4,10})\b/);
+      if (vMatch) session.fields.vendorId = vMatch[1];
+    }
+
+    // For CREATE_PO first turn with no items — try Gemini for richer extraction
+    if (session.intent === "CREATE_PO" && !session.fields.items?.length) {
+      try {
+        const gEnt = await geminiExtract(userMessage);
+        if (gEnt.vendor && !session.fields.vendor)      session.fields.vendor = gEnt.vendor;
+        if (gEnt.po_id  && !session.fields.poNumber)    session.fields.poNumber = gEnt.po_id;
+        if (gEnt.release_code && !session.fields.releaseCode) session.fields.releaseCode = gEnt.release_code;
+        if (Array.isArray(gEnt.items) && gEnt.items.length) {
+          const valid = gEnt.items.filter(it => it.description);
+          if (valid.length) {
+            session.fields.items = valid.map(it => ({
+              description: it.description, quantity: it.quantity,
+              unit: "EA", netPrice: it.price, plant: "1000"
+            }));
+          }
+        }
+      } catch { /* ignore Gemini errors */ }
+    }
+  }
+
+  log.intent = session.intent;
+  log.fields = { ...session.fields };
+
+  // ── LIST: execute immediately ─────────────────────────────────────────────
+  if (session.intent === "LIST_PENDING_POS" || session.intent === "LIST_APPROVED_POS") {
+    try {
+      const raw    = await mcp.getPendingPOs();
+      const all    = Array.isArray(raw) ? raw : (raw?.data ?? []);
+      const filter = session.intent === "LIST_APPROVED_POS" ? "APPROVED" : "PENDING";
+      const list   = all.filter(po => (po.STATUS || "PENDING").toUpperCase() === filter);
+      const text   = list.length
+        ? `Found ${list.length} ${filter.toLowerCase()} PO(s):\n\n` +
+          list.slice(0, 20).map(po =>
+            `• PO: ${po.EBELN}\n  Vendor: ${po.LIFNR} | Amount: ${po.WAERS} ${Number(po.NETWR || 0).toLocaleString()} | Date: ${po.BEDAT || "—"} | Status: ${po.STATUS}`
+          ).join("\n\n")
+        : `No ${filter.toLowerCase()} purchase orders found.`;
+      log.executed = true;
+      clearSession(sessionId);
+      return { success: true, response: text, actionPerformed: true, action: "LIST_POS", filter };
+    } catch (err) {
+      clearSession(sessionId);
+      return { success: false, error: `Failed to fetch POs: ${err.message}` };
+    }
+  }
+
+  // ── Validate items ────────────────────────────────────────────────────────
+  if (session.intent === "CREATE_PO" && session.fields.items) {
+    const errs = validateItems(session.fields.items);
+    if (errs.length) {
+      session.fields.items = null; // clear bad items so we re-ask
+      return respond(session, log,
+        "Please fix the following:\n" + errs.map(e => `• ${e}`).join("\n") +
+        "\n\nPlease provide item details again (description, quantity, price).", false);
+    }
+  }
+
+  // ── Check if all slots filled → execute ──────────────────────────────────
+  const nextSlot = getNextMissingSlot(session.intent, session.fields);
+
+  if (!nextSlot) {
+    // All slots filled — execute
+    try {
+      const f = session.fields;
+      let text, extra = {};
+
+      if (session.intent === "GET_PO_DETAILS") {
+        const raw = await mcp.getPODetail(f.poNumber);
+        text  = formatDetail(raw);
+        extra = { poNumber: f.poNumber };
+      }
+      if (session.intent === "VENDOR_PERFORMANCE") {
+        const raw = await mcp.getVendorPerformance(f.vendorId);
+        const d   = raw?.data ?? raw;
+        const lines = [
+          `Vendor Performance: ${f.vendorId}`,
+          `Total POs    : ${d?.totalPOs ?? "—"}`,
+          `Total Spend  : ${d?.totalSpend ?? "—"}`,
+          `On-Time Del. : ${d?.onTimeDeliveryPercent != null ? d.onTimeDeliveryPercent + "%" : (d?.onTimeDeliveryPct != null ? d.onTimeDeliveryPct + "%" : "—")}`,
+          `Avg Delay    : ${d?.avgDeliveryDelay != null ? d.avgDeliveryDelay + " days" : "—"}`
+        ];
+        text  = lines.join("\n");
+        extra = { action: "VENDOR_PERFORMANCE", vendorId: f.vendorId };
+      }      if (session.intent === "APPROVE_PO") {
+        const raw = await mcp.approvePO(f.poNumber, f.releaseCode);
+        const newStatus = raw?.relStatusNew || raw?.relIndicatorNew || "Approved";
+        text = `✅ PO ${f.poNumber} approved successfully.\nNew status: ${newStatus}\n${raw?.message || ""}`.trim();
+        extra = { poNumber: f.poNumber, action: "APPROVED_PO" };
+      }
+      if (session.intent === "RESET_PO") {
+        const raw = await mcp.rejectPO(f.poNumber, f.releaseCode);
+        const newStatus = raw?.relStatusNew || raw?.relIndicatorNew || "Reset";
+        text = `✅ Release reset for PO ${f.poNumber}.\nNew status: ${newStatus}\n${raw?.message || ""}`.trim();
+        extra = { poNumber: f.poNumber, action: "RESET_PO_DONE" };
+      }
+      if (session.intent === "CREATE_PO") {
+        const payload = {
+          vendor: f.vendor, companyCode: "1000", purchOrg: "1000", purchGroup: "001",
+          items: f.items.map(it => ({
+            description: it.description, quantity: it.quantity,
+            unit: "EA", netPrice: it.netPrice, plant: "1000"
+          }))
+        };
+        const raw = await mcp.createPO(payload);
+        const d   = raw?.data ?? raw;
+        const newPoNumber = d?.poNumber || d?.EBELN;
+        text = `✅ Purchase order created. New PO: ${newPoNumber || JSON.stringify(d)}`;
+        log.executed = true;
+        clearSession(sessionId);
+        return { success: true, response: text, actionPerformed: true, action: "CREATED_PO", poNumber: newPoNumber };
+      }
+
+      log.executed = true;
+      clearSession(sessionId);
+      return { success: true, response: text, actionPerformed: true, ...extra };
+
+    } catch (err) {
+      clearSession(sessionId);
+      return { success: false, error: err.message };
+    }
+  }
+
+  // ── Ask for next missing slot ─────────────────────────────────────────────
+  if (session.turnCount > MAX_TURNS) {
+    clearSession(sessionId);
+    return { success: false, error: "Could not complete the request. Please start over." };
+  }
+
+  session.pendingSlot = nextSlot;
+  const question = SLOT_QUESTIONS[nextSlot];
+  return respond(session, log, question, false);
+}
+
+// ─── respond ──────────────────────────────────────────────────────────────────
+function respond(session, log, text, actionPerformed) {
+  session.lastResponse = text;
+  console.log("[Agent]", JSON.stringify(log));
+  return { success: true, response: text, actionPerformed };
+}
+
+module.exports = { chat, clearSession };

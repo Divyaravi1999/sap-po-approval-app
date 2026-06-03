@@ -3,21 +3,22 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PO Approval Portal</title>
+  <title>Procurement Hub · SAP ECC</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Saria:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="style.css" />
   <link rel="stylesheet" href="style-additions.css" />
   <link rel="stylesheet" href="style-ai.css" />
+  <link rel="stylesheet" href="style-premium.css" />
 </head>
 <body>
 
   <!-- ── Sidebar ─────────────────────────────────────────────────── -->
   <aside class="sidebar">
     <div class="sidebar-logo">
-      <svg width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true">
-        <rect width="28" height="28" rx="7" fill="#2563eb"/>
-        <path d="M7 14h14M14 7v14" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
-      </svg>
-      <span>PO Portal</span>
+      <img src="pillir-logo.png" alt="Pillir" class="sidebar-logo-img" />
+      <span>Procurement Hub</span>
     </div>
     <nav class="sidebar-nav">
       <a class="nav-item active" id="nav-po" href="#" onclick="showPOList(); return false;">
@@ -38,15 +39,15 @@
       </a>
     </nav>
     <div class="sidebar-stats">
-      <div class="stat-card">
+      <div class="stat-card" id="stat-card-pending" onclick="filterByStatus('PENDING')" title="Show Pending POs" style="cursor:pointer;">
         <span class="stat-label">Pending</span>
         <span class="stat-value" id="stat-pending">—</span>
       </div>
-      <div class="stat-card">
+      <div class="stat-card" id="stat-card-approved" onclick="filterByStatus('APPROVED')" title="Show Approved POs" style="cursor:pointer;">
         <span class="stat-label">Approved</span>
         <span class="stat-value stat-approved" id="stat-approved">—</span>
       </div>
-      <div class="stat-card">
+      <div class="stat-card" id="stat-card-reset" onclick="filterByStatus('RESET')" title="Show Reset POs" style="cursor:pointer;">
         <span class="stat-label">Reset</span>
         <span class="stat-value stat-rejected" id="stat-rejected">—</span>
       </div>
@@ -80,22 +81,7 @@
       <!-- ── List view ──────────────────────────────────────────── -->
       <section id="view-list">
 
-        <!-- AI Command Bar -->
-        <div class="ai-command-bar">
-          <div class="ai-command-input-wrapper">
-            <span class="ai-icon">🤖</span>
-            <input 
-              id="ai-command-input" 
-              type="text" 
-              placeholder="Type a command... (Ctrl+K)"
-              class="ai-command-input"
-            />
-            <button onclick="executeAICommand()" class="ai-execute-btn">
-              Execute
-            </button>
-          </div>
-          <div id="ai-result" class="ai-result hidden"></div>
-        </div>
+        <!-- AI Command Bar removed — chat panel is in #ai-chat-panel -->
 
         <!-- Date filter bar -->
         <div class="filter-bar">
@@ -107,7 +93,7 @@
             <label class="filter-label">To Date</label>
             <input id="filter-to-date" class="input-field" type="date" onchange="loadPOList()" />
           </div>
-          <button class="btn btn-ghost" onclick="clearDateFilters()" title="Clear filters">
+          <button class="btn btn-clear" onclick="clearDateFilters()" title="Clear filters">
             <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd"/></svg>
             Clear
           </button>
@@ -356,7 +342,7 @@
             <label class="filter-label">To Date</label>
             <input id="pr-filter-to-date" class="input-field" type="date" onchange="loadPRList()" />
           </div>
-          <button class="btn btn-ghost" onclick="clearPRDateFilters()" title="Clear filters">
+          <button class="btn btn-clear" onclick="clearPRDateFilters()" title="Clear filters">
             <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd"/></svg>
             Clear
           </button>
@@ -586,7 +572,7 @@
             <input type="date" id="pr-filter-to-date" class="filter-input" />
           </div>
           <button class="btn btn-primary" onclick="loadPRList()">Apply Filter</button>
-          <button class="btn btn-ghost" onclick="clearPRDateFilters()">Clear</button>
+          <button class="btn btn-clear" onclick="clearPRDateFilters()">Clear</button>
         </div>
 
         <!-- Loading skeleton -->
@@ -751,6 +737,42 @@
     <span id="ai-toggle-icon">✨</span>
     <span id="ai-toggle-text">Enable AI Assistant</span>
   </button>
+
+  <!-- ── AI Chat Panel ──────────────────────────────────────────── -->
+  <div id="ai-chat-panel" class="ai-chat-panel">
+    <!-- Header -->
+    <div class="ai-panel-header">
+      <div class="ai-panel-title">
+        <span class="ai-panel-icon">🤖</span>
+        <div>
+          <div class="ai-panel-name">FlowAI</div>
+          <div class="ai-panel-sub">Powered by Gemini</div>
+        </div>
+      </div>
+      <button class="ai-panel-close" onclick="toggleAIMode()" title="Close">
+        <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd"/></svg>
+      </button>
+    </div>
+
+    <!-- Chat body -->
+    <div id="ai-chat-body" class="ai-chat-body"></div>
+
+    <!-- Input bar -->
+    <div class="ai-chat-footer">
+      <div class="ai-chat-input-wrap">
+        <textarea
+          id="ai-chat-input"
+          class="ai-chat-textarea"
+          placeholder="Ask me anything about POs... (Enter to send)"
+          rows="1"
+        ></textarea>
+        <button class="ai-chat-send" onclick="sendChatMessage()" title="Send">
+          <svg viewBox="0 0 20 20" fill="currentColor"><path d="M10.894 2.553a1 1 0 00-1.788 0l-7 14a1 1 0 001.169 1.409l5-1.429A1 1 0 009 15.571V11a1 1 0 112 0v4.571a1 1 0 00.725.962l5 1.428a1 1 0 001.17-1.408l-7-14z"/></svg>
+        </button>
+      </div>
+      <div class="ai-chat-hint">Shift+Enter for new line · Esc to cancel</div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
   <script src="aiAgent.js"></script>
